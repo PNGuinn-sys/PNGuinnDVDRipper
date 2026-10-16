@@ -1,56 +1,88 @@
-PNGuinnRip 4.0: Autonomous DVD-to-Plex Transcoder
+# PNGuinnRip
 
-PNGuinnRip 4.0 is a streamlined, two-stage Python utility designed to bypass structural DVD protections (common in Paramount/Disney releases) and generate high-compatibility, Plex-ready MP4s.
+Put a DVD in, get the movie out: the real main feature, with the right audio track, in sync, ready for Plex. Like HandBrake or MakeMKV, but with no clicking through titles.
 
-This script is optimized for headless Linux servers and manual execution via SSH. It prioritizes stability and playback compatibility over complex automation.
-🚀 The Workflow
+## How it finds the real movie
 
-    DNA Analysis: Scans the disc for feature-length titles. It uses a "Chaos Score" to detect structural protection and prioritize the real movie over decoy titles.
+Copy-protected discs (Paramount, Disney, Sony, special editions) often carry dozens or hundreds of decoy titles that all claim to be the movie. PNGuinnRip uses two independent signals:
 
-    Stage 1 (Direct Dump): Uses mplayer to perform a bit-for-bit stream dump from the disc directly to an SSD. This removes the "sync lag" caused by real-time encoding and maximizes hardware read speeds.
+1. **Press Play like a DVD player.** A DVD contains a small program that runs its menus and decides what plays, and protected discs use it to steer real players past the decoys. PNGuinnRip runs that program through libdvdnav (the library VLC uses): it skips warnings and trailers, presses the highlighted menu button, and notes which long title playback lands in.
+2. **Check every title's structure.** It reads the disc's IFO files (its table of contents) and looks at the list of cells (stretches of video) each title plays. A real feature plays its cells forward across the disc, once each, at a normal bitrate. Decoys play the same cells scrambled, repeat cells, or claim two hours of runtime while pointing at a few megabytes.
 
-    Stage 2 (Plex-TV Transcode): Once the raw data is safe on the drive, ffmpeg utilizes the CPU to convert the VOB into a hardware-compatible H.264 MP4.
+The menu result wins unless it is clearly a bonus feature, meaning less than half the length of the best-looking title. If the menu playthrough fails, the structure check decides alone.
 
-🛠 Prerequisites
+## How it picks the audio
 
-Ensure your Linux environment has the following packages installed:
+Track languages and types come from the IFO files, where the disc stores them. A raw VOB dump carries no language tags, which is why older versions sometimes picked Italian. Rules:
 
-    sudo apt update
-    sudo apt install lsdvd mplayer ffmpeg libdvd-pkg
-    sudo dpkg-reconfigure libdvd-pkg
+- Flagged commentary and audio description tracks are skipped.
+- Main tracks in your language (`--lang`, default `en`) come first; among those it takes the most channels, then the earliest-listed track.
+- If there is no main track in your language, it takes the disc's first track (usually the original language).
 
-📂 Configuration
+## How it rips
 
-The script contains a configuration block at the top for easy adjustment:
+ffmpeg reads the title directly through its `dvdvideo` input, which plays the title the way a player does, so timestamps stay continuous across the disc's internal seams and the audio stays in sync. Before encoding, it samples the middle of the movie to tell film from telecined film (NTSC 3:2 pulldown) from true interlaced video:
 
-    DVD_DEVICE: Default is /dev/sr0.
+| Source | Filter |
+|---|---|
+| Progressive / soft-telecined film | none |
+| Hard-telecined film (NTSC) | `fieldmatch,yadif=deint=interlaced,decimate` → back to 23.976 fps |
+| Interlaced video | `bwdif` |
 
-    OUTPUT_DIR: Directory where files are processed and saved.
+Output (default MKV):
+- H.264 video, x264 `--crf 20 --preset slow`, High@4.1 for TV and streambox decoders.
+- Stereo AAC as the default track, plus the original 5.1 AC3/DTS track copied untouched.
+- Subtitles in your language (MKV only), with forced tracks flagged.
+- The disc's chapters.
 
-    MIN_MINUTES: Minimum length to consider a title "the movie" (default: 40).
+`--mode remux` skips encoding and copies the original MPEG-2 video and audio losslessly, like MakeMKV.
 
-🖥 Usage
+The file is written to `output/.pnguinnrip-incomplete/` and moved into place only after ffmpeg succeeds and the result's length matches the title, so Plex never picks up a half-written or truncated rip.
 
-Run the script manually once a disc is inserted:
+## Requirements (Linux)
 
-    python3 PNGuinnRip4.0.py
+```bash
+sudo apt install ffmpeg libdvdnav4 libdvdread8 libdvd-pkg
+sudo dpkg-reconfigure libdvd-pkg   # builds libdvdcss for encrypted discs
+```
 
-For SSH sessions where you want to disconnect while the CPU works:
+Python 3.10+ (no pip packages). ffmpeg must be **7.0 or newer with the dvdvideo demuxer**. Check with:
 
-    nohup python3 PNGuinnRip4.0.py &
+```bash
+ffmpeg -hide_banner -demuxers | grep dvdvideo
+```
 
-📺 Plex & TV Optimization
+If that prints nothing, your distro's ffmpeg was built without libdvdnav. Use a newer distro release or an ffmpeg build that includes it.
 
-The transcode stage is specifically tuned for TV and Streambox hardware (Roku, FireStick, LG/Samsung TVs) to prevent "File Not Supported" errors:
+## Usage
 
-    Deinterlacing (yadif): Fixes the "jagged lines" (combing) typical of DVD sources.
+```bash
+# Analyze only: shows every long title, which one it picked and why, and the audio choice
+python3 -m pnguinnrip --scan
 
-    H.264 Level 4.1: Locks the complexity to a standard supported by hardware decoding chips.
+# Rip the main feature from /dev/sr0 into ./output
+python3 -m pnguinnrip
 
-    Stereo Downmix (-ac 2): Ensures audio playback on TVs without external receivers.
+# Common options
+python3 -m pnguinnrip /dev/sr1 -o /srv/media/Movies --name "The Hobbit (2012)" --eject
+python3 -m pnguinnrip --title 12            # override the automatic choice
+python3 -m pnguinnrip --mode remux          # lossless, MakeMKV-style
+python3 -m pnguinnrip --container mp4       # MP4 instead of MKV (drops subtitles)
+python3 -m pnguinnrip movie.iso             # ISO images and VIDEO_TS folders work too
+```
 
-    FastStart: Moves metadata to the front of the file so Plex can start the stream instantly.
+Run `python3 -m pnguinnrip --help` for everything. Exit status is 0 on success, 2 if the rip finished but its length doesn't match the title (possible read errors; the file is kept), and 1 on failure.
 
-🛡 Decoy Handling
+For long rips over SSH: `nohup python3 -m pnguinnrip --eject > rip.log 2>&1 &`
 
-If the script encounters a "fake" title (one that claims to be long but contains no real data), it performs a size-check after extraction. If the raw file is under 500MB, it is flagged as a decoy, deleted, and the script moves to the next candidate in the prioritized list.
+## When it picks wrong
+
+Run with `--scan` and look at the title table. Each long title is listed with its runtime, chapter count, size, and anything suspicious about its structure. Rip the right one with `--title N`, and please note the disc so the heuristics can be improved.
+
+## Tests
+
+```bash
+python3 -m unittest discover -s tests -t .
+```
+
+The tests build fake DVD structures, including a 99-decoy protected disc, so they need no drive. To also check the IFO parser against real discs, point `PNGUINNRIP_REAL_DISCS` at a folder of `VIDEO_TS` copies.

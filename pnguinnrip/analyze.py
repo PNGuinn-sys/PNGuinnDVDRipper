@@ -66,8 +66,6 @@ def analyze_title(disc, entry):
         report.problems.append(f"plays out of order ({report.backward_jumps} backward jumps)")
     if report.repeated_cells:
         report.problems.append(f"repeats cells ({report.repeated_cells})")
-    if report.tiny_cells > 5 and report.tiny_cells > report.cell_count * 0.1:
-        report.problems.append(f"{report.tiny_cells} cells under 1 second")
     if report.mbps < MIN_PLAUSIBLE_MBPS:
         report.problems.append(f"too little data for its runtime ({report.mbps:.2f} Mbps)")
     elif report.mbps > MAX_PLAUSIBLE_MBPS:
@@ -79,7 +77,27 @@ def analyze_title(disc, entry):
 
 
 def analyze_disc(disc):
-    return [analyze_title(disc, entry) for entry in disc.titles]
+    reports = [analyze_title(disc, entry) for entry in disc.titles]
+    flag_low_data_copies(reports)
+    return reports
+
+
+def flag_low_data_copies(reports):
+    """Flag titles that run as long as an in-order title but hold far less video.
+
+    Seen on Paramount discs: several titles claim the movie's exact runtime and
+    play in order, but point at a fraction of its data.
+    """
+    ordered = [r for r in reports if r.duration > 0 and not (r.backward_jumps or r.repeated_cells)]
+    for r in reports:
+        if r.duration <= 0:
+            continue
+        same_length = [o for o in ordered if o is not r
+                       and abs(o.duration - r.duration) <= max(30.0, 0.01 * r.duration)]
+        bigger = max(same_length, key=lambda o: o.size_bytes, default=None)
+        if bigger and bigger.size_bytes >= 1.5 * r.size_bytes:
+            share = r.size_bytes / bigger.size_bytes * 100
+            r.problems.append(f"only {share:.0f}% of the video data of same-length title {bigger.number}")
 
 
 def rank_structural(reports):

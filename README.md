@@ -39,20 +39,23 @@ Output (default MKV):
 
 The file is written to `output/.pnguinnrip-incomplete/` and moved into place only after ffmpeg succeeds and the result's length matches the title, so Plex never picks up a half-written or truncated rip.
 
+Before ripping, it also checks that the chosen audio track actually holds data. Some discs list tracks they never store; if so, it falls back to another track, or rips video only. While ripping, a watchdog stops ffmpeg if it makes no progress for 5 minutes (`--stall-minutes`), so a damaged disc fails with an error instead of hanging forever.
+
 ## Requirements (Linux)
 
 ```bash
-sudo apt install ffmpeg libdvdnav4 libdvdread8 libdvd-pkg
+sudo apt install libdvdnav4 libdvdread8 libdvd-pkg
 sudo dpkg-reconfigure libdvd-pkg   # builds libdvdcss for encrypted discs
+python3 -m pnguinnrip.get_ffmpeg   # downloads a known-good ffmpeg (see below)
 ```
 
-Python 3.10+ (no pip packages). ffmpeg must be **7.0 or newer with the dvdvideo demuxer**. Check with:
+Python 3.10+ (no pip packages).
 
-```bash
-ffmpeg -hide_banner -demuxers | grep dvdvideo
-```
+**ffmpeg:** pnguinnrip needs FFmpeg 7.0+ with the `dvdvideo` DVD reader **and** the `libx264` encoder, and most distro builds lack one or the other. `python3 -m pnguinnrip.get_ffmpeg` downloads [BtbN's GPL build](https://github.com/BtbN/FFmpeg-Builds), which has both:
+- It verifies the build's checksum and that it includes both.
+- It installs to `~/.local/share/pnguinnrip/ffmpeg`, which pnguinnrip uses automatically. Nothing is installed system-wide.
 
-If that prints nothing, your distro's ffmpeg was built without libdvdnav. Use a newer distro release or an ffmpeg build that includes it.
+To use a different ffmpeg, pass `--ffmpeg-dir /path/to/bin`. pnguinnrip checks ffmpeg before it starts and tells you exactly what is missing.
 
 ## Usage
 
@@ -69,6 +72,7 @@ python3 -m pnguinnrip --title 12            # override the automatic choice
 python3 -m pnguinnrip --mode remux          # lossless, MakeMKV-style
 python3 -m pnguinnrip --container mp4       # MP4 instead of MKV (drops subtitles)
 python3 -m pnguinnrip movie.iso             # ISO images and VIDEO_TS folders work too
+python3 -m pnguinnrip --verbose             # show libdvdread/libdvdnav messages (CSS keys etc.)
 ```
 
 Run `python3 -m pnguinnrip --help` for everything. Exit status is 0 on success, 2 if the rip finished but its length doesn't match the title (possible read errors; the file is kept), and 1 on failure.

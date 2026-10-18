@@ -139,6 +139,134 @@ class FfmpegTests(unittest.TestCase):
         self.assertEqual(ffmpeg.language_tags("fr"), {"fr", "fre", "fra"})
 
 
+DEMUXERS = """File formats:
+ D. = Demuxing supported
+ --
+ D  dv              DV (Digital Video)
+ D  dvdvideo        DVD-Video
+"""
+ENCODERS_NO_X264 = """Encoders:
+ ------
+ V....D mpeg2video           MPEG-2 video
+ A....D aac                  AAC (Advanced Audio Coding)
+"""
+ENCODERS_X264 = ENCODERS_NO_X264 + " V....D libx264              libx264 H.264 / AVC\n"
+
+
+class ToolCheckTests(unittest.TestCase):
+    def test_build_without_x264_is_caught(self):
+        # What the first real rip hit: "Unrecognized option 'crf'".
+        missing = ffmpeg.missing_features(DEMUXERS, ENCODERS_NO_X264, need_x264=True)
+        self.assertEqual(missing, ["the libx264 H.264 encoder"])
+
+    def test_remux_does_not_need_x264(self):
+        self.assertEqual(ffmpeg.missing_features(DEMUXERS, ENCODERS_NO_X264, need_x264=False), [])
+
+    def test_missing_dvdvideo(self):
+        missing = ffmpeg.missing_features(" D  dv   DV\n", ENCODERS_X264, need_x264=True)
+        self.assertEqual(len(missing), 1)
+        self.assertIn("dvdvideo", missing[0])
+
+    def test_ffmpeg_dir_override_must_exist(self):
+        with self.assertRaises(ffmpeg.FfmpegError):
+            ffmpeg.find_tools(tempfile.mkdtemp())
+
+    def test_pick_newest_numbered_build(self):
+        from pnguinnrip.get_ffmpeg import pick_asset
+        assets = [{"name": n} for n in (
+            "ffmpeg-master-latest-linux64-gpl.tar.xz",
+            "ffmpeg-n8.1-latest-linux64-gpl-8.1.tar.xz",
+            "ffmpeg-n9.0-latest-linux64-gpl-9.0.tar.xz",
+            "ffmpeg-n9.0-latest-linux64-lgpl-9.0.tar.xz",
+            "ffmpeg-n9.0-latest-win64-gpl-9.0.zip",
+            "ffmpeg-n6.1-latest-linux64-gpl-6.1.tar.xz",
+        )]
+        self.assertEqual(pick_asset(assets, "linux64")["name"], "ffmpeg-n9.0-latest-linux64-gpl-9.0.tar.xz")
+        self.assertEqual(pick_asset(assets, "linux64", "8.1")["name"], "ffmpeg-n8.1-latest-linux64-gpl-8.1.tar.xz")
+        self.assertEqual(pick_asset(assets, "win64")["name"], "ffmpeg-n9.0-latest-win64-gpl-9.0.zip")
+        self.assertIsNone(pick_asset(assets, "linux64", "6.1"))  # too old for dvdvideo
+
+
+class MissingAudioTests(unittest.TestCase):
+    """The IFO can list an audio track the disc never stores (seen on a real sample)."""
+
+    def setUp(self):
+        self.audio, _ = tracks_for([FakeAudio("en", channels=6), FakeAudio("en", channels=2)])
+        self.streams = ffmpeg.parse_probe(json.dumps({"streams": [
+            {"index": 0, "codec_type": "video", "id": "0x1e0"},
+            {"index": 1, "codec_type": "audio", "id": "0x80"},
+            {"index": 2, "codec_type": "audio", "id": "0x81"},
+        ]}))
+        self.chosen = analyze.choose_audio(self.audio, "en")
+
+    def test_keeps_choice_when_it_has_data(self):
+        from pnguinnrip.cli import pick_audio_with_data
+        track, index = pick_audio_with_data(self.streams, self.audio, self.chosen, {0, 1, 2}, "en")
+        self.assertIs(track, self.chosen)
+        self.assertEqual(index, 1)
+
+    def test_falls_back_to_a_track_with_data(self):
+        from pnguinnrip.cli import pick_audio_with_data
+        track, index = pick_audio_with_data(self.streams, self.audio, self.chosen, {0, 2}, "en")
+        self.assertEqual(track.attr.index, 1)
+        self.assertEqual(index, 2)
+
+    def test_video_only_when_no_audio_has_data(self):
+        from pnguinnrip.cli import pick_audio_with_data
+        self.assertEqual(pick_audio_with_data(self.streams, self.audio, self.chosen, {0}, "en"), (None, None))
+
+    def test_unknown_data_keeps_choice(self):
+        from pnguinnrip.cli import pick_audio_with_data
+        track, _ = pick_audio_with_data(self.streams, self.audio, self.chosen, None, "en")
+        self.assertIs(track, self.chosen)
+
+    def test_command_without_audio(self):
+        plan = ffmpeg.RipPlan(source="/dev/sr0", title=1, output="o.mkv", video_index=0, audio_index=None,
+                              audio_channels=0, audio_coding="", audio_language="", scan_type="progressive")
+        cmd = ffmpeg.build_command(plan)
+        self.assertEqual(cmd.count("-map"), 1)
+        self.assertNotIn("aac", cmd)
+        self.assertFalse(any(arg.startswith("-disposition:a") for arg in cmd))
+
+
+class WatchdogTests(unittest.TestCase):
+    def test_stalled_ffmpeg_is_stopped(self):
+        import sys
+        import time
+        fake = [sys.executable, "-c",
+                "import time; print('out_time_us=1000000', flush=True); time.sleep(60)"]
+        start = time.monotonic()
+        with self.assertRaises(ffmpeg.FfmpegError) as ctx:
+            ffmpeg.run_with_progress(fake, 100, log=lambda m: None, stall_seconds=1)
+        self.assertIn("no progress", str(ctx.exception))
+        self.assertLess(time.monotonic() - start, 15)
+
+    def test_normal_run_finishes(self):
+        import sys
+        fake = [sys.executable, "-c",
+                "print('out_time_us=50000000'); print('out_time_us=100000000'); print('progress=end')"]
+        messages = []
+        ffmpeg.run_with_progress(fake, 100, log=messages.append, stall_seconds=5)
+        self.assertEqual(messages[-1].strip(), "100%")
+
+
+class LibraryLogTests(unittest.TestCase):
+    def test_banner_is_flattened_and_tagged(self):
+        from pnguinnrip.discio import LibraryLog
+        log = LibraryLog("libdvdread")
+        log._func(None, 2, b"Encrypted DVD support unavailable.\n****\n**  No css library  **\n****", None)
+        self.assertEqual(log.messages, ["libdvdread warning: Encrypted DVD support unavailable. No css library"])
+
+
+class NativeStderrTests(unittest.TestCase):
+    def test_capture(self):
+        import os
+        from pnguinnrip.discio import capture_native_stderr
+        with capture_native_stderr() as noise:
+            os.write(2, b"libdvdread: Get key for /VIDEO_TS/VTS_01_1.VOB\n")
+        self.assertIn("Get key", noise[0])
+
+
 class NamingTests(unittest.TestCase):
     def test_pretty_name(self):
         self.assertEqual(pretty_name("THE_HOBBIT_DESOLATION"), "The Hobbit Desolation")

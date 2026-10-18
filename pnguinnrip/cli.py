@@ -5,7 +5,7 @@ import subprocess
 import sys
 
 from . import analyze, ffmpeg, navigator
-from .discio import DiscReadError, open_disc
+from .discio import DiscReadError, capture_native_stderr, open_disc
 from .ifo import IfoError
 
 
@@ -32,6 +32,11 @@ def parse_args(argv):
                    help="skip the menu playthrough and pick by structure only")
     p.add_argument("--menu-timeout", type=float, default=180, help="seconds to spend on the menu playthrough")
     p.add_argument("--eject", action="store_true", help="eject the disc when done")
+    p.add_argument("--ffmpeg-dir", help="folder containing the ffmpeg and ffprobe to use")
+    p.add_argument("--stall-minutes", type=float, default=5,
+                   help="stop the rip if ffmpeg makes no progress for this long (default: 5)")
+    p.add_argument("-v", "--verbose", action="store_true",
+                   help="show libdvdread/libdvdnav messages (CSS keys etc.)")
     args = p.parse_args(argv)
     args.lang = args.lang.lower()
     if args.mode == "remux" and args.container == "mp4":
@@ -41,6 +46,11 @@ def parse_args(argv):
 
 def log(message=""):
     print(message, flush=True)
+
+
+def show_messages(messages):
+    for message in messages:
+        log(f"      {message}")
 
 
 def fmt_minutes(seconds):
@@ -80,6 +90,32 @@ def unique_path(directory, name, extension):
     return path
 
 
+def pick_audio_with_data(streams, tracks, chosen, with_data, language):
+    """Swap out a chosen audio track that the disc lists but never stores.
+
+    Returns (track, ffmpeg_index); (None, None) means rip without audio.
+    """
+    if chosen is None:
+        return None, None
+    indexes = {}
+    for track in tracks:
+        try:
+            indexes[track.stream_id] = ffmpeg.match_audio(streams, track, tracks)
+        except ffmpeg.FfmpegError:
+            pass
+    if with_data is None or indexes.get(chosen.stream_id) in with_data:
+        return chosen, ffmpeg.match_audio(streams, chosen, tracks)
+
+    playable = [t for t in tracks if indexes.get(t.stream_id) in with_data]
+    fallback = analyze.choose_audio(playable, language)
+    if fallback is None:
+        log(f"[!] The disc lists audio ({describe_audio(chosen)}) but stores none; ripping video only.")
+        return None, None
+    log(f"[!] Audio {describe_audio(chosen)} is listed but holds no sound; "
+        f"using {describe_audio(fallback)} instead.")
+    return fallback, indexes[fallback.stream_id]
+
+
 def main(argv=None):
     args = parse_args(argv)
     try:
@@ -93,8 +129,16 @@ def main(argv=None):
 
 
 def run(args):
+    if not args.scan:
+        # Fail now, not after the menu playthrough, if ffmpeg can't do the job.
+        log(f"[+] Using {ffmpeg.check_tools(args.ffmpeg_dir, need_x264=args.mode == 'transcode')}")
+
     log(f"[+] Reading disc structure from {args.source}...")
-    disc, label = open_disc(args.source)
+    messages = []
+    with capture_native_stderr(not args.verbose):
+        disc, label = open_disc(args.source, messages)
+    if args.verbose:
+        show_messages(messages)
     reports = analyze.analyze_disc(disc)
     by_number = {r.number: r for r in reports}
 
@@ -109,11 +153,20 @@ def run(args):
         if not args.no_menu:
             log("[+] Playing the disc's menus to see where 'Play' leads...")
             durations = {r.number: r.duration for r in reports}
-            nav_title = navigator.find_main_title(
-                args.source, durations, args.min_minutes * 60, language=args.lang,
-                region_mask=disc.region_mask, time_budget=args.menu_timeout, log=log)
+            messages = []
+            with capture_native_stderr(not args.verbose) as noise:
+                nav_title = navigator.find_main_title(
+                    args.source, durations, args.min_minutes * 60, language=args.lang,
+                    region_mask=disc.region_mask, time_budget=args.menu_timeout, log=log,
+                    messages=messages)
+            messages += noise[0].strip().splitlines()
+            if args.verbose:
+                show_messages(messages)
             if nav_title:
                 log(f"    'Play' leads to title {nav_title}.")
+            elif messages and not args.verbose:
+                log("    libdvdnav's last messages:")
+                show_messages(messages[-12:])
         choice = analyze.choose_title(reports, args.min_minutes, nav_title)
         if choice is None:
             print_titles(reports, args.min_minutes)
@@ -131,11 +184,10 @@ def run(args):
     audio_tracks = analyze.title_audio_tracks(disc, entry)
     audio = analyze.choose_audio(audio_tracks, args.lang)
     if audio is None:
-        log("[!] This title has no readable audio tracks.")
-        return 1
+        log("    note: the disc lists no audio for this title")
     for track in audio_tracks:
         log(f"    {'->' if track is audio else '  '} audio {describe_audio(track)}")
-    if audio.attr.language != args.lang:
+    if audio and audio.attr.language != args.lang:
         log(f"    note: no main '{args.lang}' audio track; using the disc's default")
     sub_tracks = analyze.choose_subtitles(analyze.title_subtitle_tracks(disc, entry), args.lang)
     log(f"    subtitles: {len(sub_tracks)} '{args.lang}' track(s)"
@@ -145,13 +197,18 @@ def run(args):
         return 0
 
     # 3. Rip.
-    ffmpeg.check_tools()
     streams = ffmpeg.probe(args.source, report.number)
     video = next((s.index for s in streams if s.kind == "video"), None)
     if video is None:
         raise ffmpeg.FfmpegError("ffmpeg sees no video in this title")
     subtitle_indexes = ffmpeg.match_subtitles(streams, sub_tracks, args.lang)
     forced_ids = {i for t in sub_tracks if t.attr.is_forced for i in t.stream_ids}
+
+    log("[+] Checking that the tracks hold data...")
+    with_data = ffmpeg.streams_with_data(args.source, report.number)
+    if with_data is not None and video not in with_data:
+        raise ffmpeg.FfmpegError("the title's video stream holds no data; the disc may be damaged")
+    audio, audio_index = pick_audio_with_data(streams, audio_tracks, audio, with_data, args.lang)
 
     scan_type = None
     if args.mode == "transcode":
@@ -169,9 +226,10 @@ def run(args):
 
     plan = ffmpeg.RipPlan(
         source=args.source, title=report.number, output=partial,
-        video_index=video, audio_index=ffmpeg.match_audio(streams, audio, audio_tracks),
-        audio_channels=audio.attr.channels, audio_coding=audio.attr.coding,
-        audio_language=audio.attr.language,
+        video_index=video, audio_index=audio_index,
+        audio_channels=audio.attr.channels if audio else 0,
+        audio_coding=audio.attr.coding if audio else "",
+        audio_language=audio.attr.language if audio else "",
         subtitle_indexes=subtitle_indexes,
         forced_subtitle_indexes=[s.index for s in streams if s.stream_id in forced_ids],
         mode=args.mode, container=args.container, scan_type=scan_type,
@@ -179,7 +237,8 @@ def run(args):
 
     log(f"[+] Ripping title {report.number} to {name}.{args.container} ({args.mode})...")
     try:
-        ffmpeg.run_with_progress(ffmpeg.build_command(plan), report.duration, log)
+        ffmpeg.run_with_progress(ffmpeg.build_command(plan), report.duration, log,
+                                 stall_seconds=args.stall_minutes * 60)
     except BaseException:
         if os.path.exists(partial):
             os.remove(partial)

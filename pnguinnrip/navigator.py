@@ -12,6 +12,8 @@ import os
 import time
 from collections import Counter
 
+from .discio import LibraryLog, LoggerCallbacks
+
 DVDNAV_STATUS_OK = 1
 
 DVDNAV_BLOCK_OK = 0
@@ -65,11 +67,17 @@ def load_libdvdnav():
         "dvdnav_button_select": ([nav, ctypes.c_void_p, ctypes.c_int32], ctypes.c_int),
         "dvdnav_button_activate": ([nav, ctypes.c_void_p], ctypes.c_int),
     }
+    optional = {
+        "dvdnav_set_region_mask",  # missing from very old builds
+        "dvdnav_open2",            # libdvdnav 6.1+; takes a log callback
+    }
+    signatures["dvdnav_open2"] = ([ctypes.POINTER(ctypes.c_void_p), ctypes.c_void_p,
+                                   ctypes.POINTER(LoggerCallbacks), ctypes.c_char_p], ctypes.c_int)
     for name, (argtypes, restype) in signatures.items():
         func = getattr(lib, name, None)
         if func is None:
-            if name == "dvdnav_set_region_mask":
-                continue  # optional; very old builds lack it
+            if name in optional:
+                continue
             return None
         func.argtypes = argtypes
         func.restype = restype
@@ -88,8 +96,11 @@ def button_count(pci):
 
 
 def find_main_title(source, title_durations, min_seconds, *, language="en",
-                    region_mask=0, time_budget=180.0, log=print):
-    """Return the title number "Play" leads to, or None if we couldn't tell."""
+                    region_mask=0, time_budget=180.0, log=print, messages=None):
+    """Return the title number "Play" leads to, or None if we couldn't tell.
+
+    libdvdnav's own messages are appended to `messages` if a list is given.
+    """
     lib = load_libdvdnav()
     if lib is None:
         log("    libdvdnav not found; skipping menu playthrough "
@@ -97,7 +108,13 @@ def find_main_title(source, title_durations, min_seconds, *, language="en",
         return None
 
     nav = ctypes.c_void_p()
-    if lib.dvdnav_open(ctypes.byref(nav), os.fsencode(source)) != DVDNAV_STATUS_OK:
+    library_log = LibraryLog("libdvdnav", messages)  # must outlive the dvdnav handle
+    if hasattr(lib, "dvdnav_open2"):
+        opened = lib.dvdnav_open2(ctypes.byref(nav), None, ctypes.byref(library_log.callbacks),
+                                  os.fsencode(source))
+    else:
+        opened = lib.dvdnav_open(ctypes.byref(nav), os.fsencode(source))
+    if opened != DVDNAV_STATUS_OK:
         log("    libdvdnav could not open the disc")
         return None
 

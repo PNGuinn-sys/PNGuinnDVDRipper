@@ -52,6 +52,43 @@ class StructureTests(unittest.TestCase):
         decoy = next(r for r in reports if r.number == 1)
         self.assertGreater(decoy.backward_jumps, 0)
 
+    def test_up_in_the_air_layout(self):
+        """Modeled on a real Paramount disc (Up in the Air, 99 titles).
+
+        The real movie has a few sub-second cells (all its copies do too);
+        four in-order copies claim the same runtime but hold ~55% of the
+        data; others are scrambled.
+        """
+        real = contiguous_cells(0, 109, count=24, mbps=6.2)
+        cells, sector = [], 0
+        for c in real:
+            cells.append(FakeCell(sector, sector + c.last - c.first, c.seconds))
+            sector = cells[-1].last + 1
+            if len(cells) <= 12 and len(cells) % 2:
+                cells.append(FakeCell(sector, sector + 39, 0.5))
+                sector += 40
+        thin = []
+        for c in cells:
+            span = max(1, int((c.last - c.first + 1) * 0.55))
+            thin.append(FakeCell(c.first, c.first + span - 1, c.seconds))
+        rng = random.Random(3)
+        scrambled = list(cells)
+        rng.shuffle(scrambled)
+        titles = [FakeTitle(contiguous_cells(9_000_000, 0.1, count=1))]   # 1: warning
+        titles += [FakeTitle(scrambled)] * 4                               # 2-5: decoys
+        titles += [FakeTitle(thin)] * 4                                    # 6-9: thin copies
+        titles += [FakeTitle(cells)]                                       # 10: the movie
+        disc, reports = load(titles)
+        by_number = {r.number: r for r in reports}
+
+        self.assertTrue(by_number[10].clean, by_number[10].problems)
+        self.assertIn("only 55% of the video data of same-length title 10",
+                      "; ".join(by_number[6].problems))
+        choice = analyze.choose_title(reports, 40)
+        self.assertEqual(choice.report.number, 10)
+        self.assertEqual(choice.reason, "only title with a clean structure")
+        self.assertEqual(analyze.choose_title(reports, 40, navigator_title=10).warnings, [])
+
     def test_decoy_claiming_long_runtime_with_no_data(self):
         junk = [FakeCell(500 + i, 500 + i, 300.0) for i in range(30)]  # 2.5 h in 30 sectors
         disc, reports = load([

@@ -95,7 +95,7 @@ class LibraryLog:
 
     def _record(self, _priv, level, fmt, args):
         text = None
-        if _vsnprintf and fmt:
+        if _vsnprintf and fmt and args:  # glibc dereferences va_list even with no %-specs
             buffer = ctypes.create_string_buffer(1024)
             try:
                 if _vsnprintf(buffer, len(buffer), fmt, args) >= 0:

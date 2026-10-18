@@ -23,6 +23,7 @@ class TitleReport:
     repeated_cells: int = 0
     tiny_cells: int = 0
     size_bytes: int = 0
+    thin_copy_of: int = 0  # title number this one is a low-data copy of
     problems: list = field(default_factory=list)
 
     @property
@@ -97,6 +98,7 @@ def flag_low_data_copies(reports):
         bigger = max(same_length, key=lambda o: o.size_bytes, default=None)
         if bigger and bigger.size_bytes >= 1.5 * r.size_bytes:
             share = r.size_bytes / bigger.size_bytes * 100
+            r.thin_copy_of = bigger.number
             r.problems.append(f"only {share:.0f}% of the video data of same-length title {bigger.number}")
 
 
@@ -135,6 +137,16 @@ def choose_title(reports, min_minutes, navigator_title=None):
                             f"much shorter than title {best.number} ({best.duration / 60:.0f} min); "
                             "probably a bonus feature")
         else:
+            # Paramount discs can steer libdvdnav into a thinned copy of the
+            # movie: same runtime, a fraction of the data, often no audio. The
+            # menu still tells us which cut; the full copy is the real one.
+            full = next((r for r in reports if r.number == picked.thin_copy_of), None)
+            if full is not None and full.clean:
+                warnings.append(f"the menu led to title {picked.number}, which holds only "
+                                f"{picked.size_bytes / full.size_bytes * 100:.0f}% of title "
+                                f"{full.number}'s data; using title {full.number}")
+                return TitleChoice(full, f"the full copy of title {picked.number}, "
+                                         "which the disc's menu plays", warnings)
             if picked.problems and picked.number != best.number:
                 warnings.append(f"title {picked.number} looks unusual ({'; '.join(picked.problems)}), "
                                 "but it is what the disc's menu plays")

@@ -3,8 +3,14 @@
 A DVD contains a small program (the "VM" commands in its menus) that decides
 what plays. Copy-protected discs hide the real movie among decoys and rely
 on that program to steer players to it. libdvdnav runs the program for us;
-we skip warnings and trailers, press the highlighted menu button, and note
-which long title playback lands in.
+we skip warnings and trailers, press the highlighted button on menus that
+wait for input, and note which long title playback lands in.
+
+Like a person with a remote, we only press on a menu that is waiting: one
+frozen on a still frame, or one that has come around again. Some discs
+(Paranormal Activity 2) open with brief black screens full of hidden
+buttons that time out on their own; pressing them leads into a maze that
+ends at a decoy title.
 """
 import ctypes
 import ctypes.util
@@ -24,9 +30,16 @@ DVDNAV_NAV_PACKET = 7
 DVDNAV_STOP = 8
 DVDNAV_WAIT = 13
 
-# Offset of hli.hl_gi.btn_ns (number of buttons) in libdvdread's packed pci_t.
+# Offsets into libdvdread's packed pci_t: hli.hl_gi.btn_ns (number of
+# buttons), hli.hl_gi.fosl_btnn (button the disc says to highlight first),
+# and hli.btnit (18-byte button entries, each ending in its 8-byte command).
 PCI_BUTTON_COUNT_OFFSET = 113
+PCI_FORCED_SELECT_OFFSET = 116
+PCI_BUTTONS_OFFSET = 142
+BUTTON_SIZE = 18
+BUTTON_COMMAND_OFFSET = 10
 MAX_BUTTONS = 36
+STILL_FOREVER = 0xFF
 
 
 def load_libdvdnav():
@@ -95,6 +108,18 @@ def button_count(pci):
     return count if 0 < count <= MAX_BUTTONS else None
 
 
+def _menu_screen(lib, nav):
+    """Identify the menu on screen by its buttons' commands, or None if it has none."""
+    pci = lib.dvdnav_get_current_nav_pci(nav)
+    count = button_count(pci) if pci else None
+    if not count:
+        return None
+    raw = ctypes.string_at(pci + PCI_BUTTONS_OFFSET, BUTTON_SIZE * count)
+    commands = tuple(raw[i * BUTTON_SIZE + BUTTON_COMMAND_OFFSET:(i + 1) * BUTTON_SIZE]
+                     for i in range(count))
+    return bool(lib.dvdnav_is_domain_vmgm(nav)), commands
+
+
 def find_main_title(source, title_durations, min_seconds, *, language="en",
                     region_mask=0, time_budget=180.0, log=print, messages=None):
     """Return the title number "Play" leads to, or None if we couldn't tell.
@@ -135,8 +160,10 @@ def find_main_title(source, title_durations, min_seconds, *, language="en",
 def _play(lib, nav, title_durations, min_seconds, time_budget, log):
     buf = (ctypes.c_uint8 * 2048)()
     event, length = ctypes.c_int32(), ctypes.c_int32()
-    title, part, button = ctypes.c_int32(), ctypes.c_int32(), ctypes.c_int32()
-    presses = Counter()  # (menu, button) -> times activated
+    title, part = ctypes.c_int32(), ctypes.c_int32()
+    presses = Counter()  # (screen, button) -> times activated
+    visits = Counter()   # screen -> times it has started playing
+    new_cell = True
     seen_short = set()
     deadline = time.monotonic() + time_budget
 
@@ -145,15 +172,22 @@ def _play(lib, nav, title_durations, min_seconds, time_budget, log):
             log(f"    playback error: {(lib.dvdnav_err_to_string(nav) or b'').decode(errors='replace')}")
             return None
         ev = event.value
+        in_menu = not lib.dvdnav_is_domain_vts(nav)
 
         if ev == DVDNAV_STILL_FRAME:
-            lib.dvdnav_still_skip(nav)
+            # A menu frozen for good is waiting for input; a timed still is not.
+            screen = _menu_screen(lib, nav) if in_menu and buf[0] == STILL_FOREVER else None
+            if not (screen and _press_menu_button(lib, nav, screen, presses, log, "waiting")):
+                lib.dvdnav_still_skip(nav)
         elif ev == DVDNAV_WAIT:
             lib.dvdnav_wait_skip(nav)
         elif ev == DVDNAV_STOP:
             log("    disc stopped before reaching a long title")
             return None
-        elif ev in (DVDNAV_VTS_CHANGE, DVDNAV_CELL_CHANGE) and lib.dvdnav_is_domain_vts(nav):
+        elif ev in (DVDNAV_VTS_CHANGE, DVDNAV_CELL_CHANGE):
+            new_cell = True
+            if in_menu:
+                continue
             lib.dvdnav_current_title_info(nav, ctypes.byref(title), ctypes.byref(part))
             if title.value <= 0:
                 continue
@@ -165,36 +199,48 @@ def _play(lib, nav, title_durations, min_seconds, time_budget, log):
                     f"({title_durations.get(title.value, 0) / 60:.1f} min: warning/trailer)")
             # Press "Next" like you would on a remote to get past it.
             lib.dvdnav_next_pg_search(nav)
-        elif ev == DVDNAV_NAV_PACKET and not lib.dvdnav_is_domain_vts(nav):
-            _press_menu_button(lib, nav, title, part, button, presses, log)
+        elif ev == DVDNAV_NAV_PACKET and in_menu and new_cell:
+            screen = _menu_screen(lib, nav)
+            if screen is None:
+                continue
+            new_cell = False
+            visits[screen] += 1
+            # A looping (animated) menu never freezes; press once it comes around again.
+            if visits[screen] >= 2:
+                _press_menu_button(lib, nav, screen, presses, log, "looped")
 
     log("    gave up: menu playthrough took too long")
     return None
 
 
-def _press_menu_button(lib, nav, title, part, button, presses, log):
-    if lib.dvdnav_get_current_highlight(nav, ctypes.byref(button)) != DVDNAV_STATUS_OK:
-        return
-    if button.value <= 0:
-        return
+def _press_menu_button(lib, nav, screen, presses, log, why):
+    """Press the button a viewer would land on; True if the press went through."""
     pci = lib.dvdnav_get_current_nav_pci(nav)
     if not pci:
-        return
-    lib.dvdnav_current_title_info(nav, ctypes.byref(title), ctypes.byref(part))
-    menu = (bool(lib.dvdnav_is_domain_vmgm(nav)), part.value)
+        return False
+    count = len(screen[1])
+    button = ctypes.c_int32()
+    if lib.dvdnav_get_current_highlight(nav, ctypes.byref(button)) != DVDNAV_STATUS_OK:
+        button.value = 0
+    # libdvdnav ignores the disc's forced-select button; a player highlights it.
+    forced = ctypes.c_uint8.from_address(pci + PCI_FORCED_SELECT_OFFSET).value
+    choice = forced if 0 < forced <= count else button.value
+    if not 0 < choice <= count:
+        choice = 1
 
-    choice = button.value
-    if presses[(menu, choice)] >= 2:
+    if presses[(screen, choice)] >= 2:
         # The highlighted button keeps bringing us back here (e.g. a
         # "Languages" page whose default is "Back"); try the next one.
-        limit = button_count(pci) or 12
-        untried = [b for b in range(1, limit + 1) if presses[(menu, b)] < 2]
+        untried = [b for b in range(1, count + 1) if presses[(screen, b)] < 2]
         if not untried:
-            return
+            return False
         choice = untried[0]
+    if choice != button.value:
         lib.dvdnav_button_select(nav, pci, choice)
 
-    if lib.dvdnav_button_activate(nav, pci) == DVDNAV_STATUS_OK:
-        presses[(menu, choice)] += 1
-        where = "main menu" if menu[0] else f"menu {menu[1]}"
-        log(f"    pressed button {choice} on {where}")
+    if lib.dvdnav_button_activate(nav, pci) != DVDNAV_STATUS_OK:
+        return False
+    presses[(screen, choice)] += 1
+    where = "disc menu" if screen[0] else "title menu"
+    log(f"    pressed button {choice} of {count} on a {where} ({why})")
+    return True
